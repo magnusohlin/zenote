@@ -50,6 +50,26 @@ Copying gives you the real text: no screen padding, and wrapped lines stay whole
 
 If a note is changed on disk while it's open (for example by another program), zenote reloads it within a second.
 
+## Using your notes with Claude Code
+
+Since notes are plain files, [Claude Code](https://claude.com/claude-code) can read and edit them. Tell it where they live by adding this to `~/.claude/CLAUDE.md`, which applies to every project:
+
+```markdown
+# Personal notes
+
+I keep notes as plain markdown files in `~/notes/<name>.md`, written with the
+`notes` terminal app. When I mention "my notes", "the X note", or ask you to
+save or add something to a note, read or edit those files directly.
+`notes -l` lists them, most recent first. If a note is open in the app while
+you edit it, the app reloads it within a second.
+```
+
+Then you can say things like:
+
+- "check my ideas note and turn it into a ranked top 5"
+- "add a summary of this conversation to my standup note"
+- "what did I write about pricing in my notes?"
+
 ## Configuration
 
 Environment variables:

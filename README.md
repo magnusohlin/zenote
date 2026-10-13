@@ -4,36 +4,7 @@ A quiet place to write, in the terminal.
 
 Type `notes` and your terminal turns into a calm landscape (a cream sky over soft lavender mountains, or a dusk version at night) with a single narrow column of text in the middle. No menus, no chrome. Inspired by [OmmWriter](https://ommwriter.com).
 
-```text
-╭────────────────────────────────────────────────────────────────────────────╮
-│                                                                            │
-│                                                                            │
-│                                                                            │
-│                                                                            │
-│                                                                            │
-│                   morning pages.                                           │
-│                                                                            │
-│                   - call the printer about the quote                       │
-│                   - [ ] draft the roadmap                                  │
-│                   - read that essay again                                  │
-│                                                                            │
-│                   ideas come when you stop looking.▏                       │
-│                                                                            │
-│···········                                                                 │
-│··············                    ···                                       │
-│·················     ░░░░░░░░░░··········                                  │
-│░░░░░········░░░░░░░░░░░░░░░░░░░░░░░░░░░░░········                          │
-│░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  ··········  ·······│
-│░▒▒▒▒░░▒▒▒▒▒▒▒▒▒▒░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░·············░░│
-│▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒░▒░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░│
-│▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒░░░▒▒░░░░░░░░░░░░░░░░░░░░░░░░░░▒▒▒▒▒▒▒▒▒▒▒│
-│▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒░░░░░░░░░░░░░░░░▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒│
-│▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒ notes                         21 words ▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒│
-│▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒│
-╰────────────────────────────────────────────────────────────────────────────╯
-```
-
-<sub>The mountains are drawn from the same shapes the app renders, shown here in shading. In the terminal they're a soft truecolor gradient.</sub>
+![zenote in night mode](docs/screenshot.png)
 
 Notes are plain markdown files in `~/notes`, so anything else can read them: grep, your editor, or an AI assistant like Claude Code.
 

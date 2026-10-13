@@ -1,0 +1,820 @@
+#!/usr/bin/env python3
+"""notes: a quiet place to write, in the terminal.
+
+  notes            open the last note
+  notes NAME       open (or create) a note called NAME
+  notes -l         list notes
+  notes --dir      print where notes live
+
+Inside, just type. Everything saves on its own.
+  ctrl-o  switch / create note      ctrl-z  undo
+  ctrl-c  copy selection or note    ctrl-t  day / night
+  esc     close
+Drag with the mouse to select; the selection is copied as clean text.
+
+Notes are plain markdown files in ~/notes (override with NOTES_DIR).
+"""
+
+import base64
+import codecs
+import json
+import math
+import os
+import random
+import re
+import select
+import signal
+import subprocess
+import sys
+import termios
+import time
+import tty
+from pathlib import Path
+
+NOTES_DIR = Path(os.environ.get("NOTES_DIR", "~/notes")).expanduser()
+STATE_FILE = NOTES_DIR / ".state.json"
+WIDTH = int(os.environ.get("NOTES_WIDTH", "64"))
+TRUECOLOR = os.environ.get("NOTES_COLOR") != "256" and (
+    os.environ.get("COLORTERM", "") in ("truecolor", "24bit")
+    or os.environ.get("TERM_PROGRAM", "") in ("iTerm.app", "ghostty", "WezTerm", "WarpTerminal", "vscode", "Apple_Terminal")
+)
+
+THEMES = {
+    "day": dict(
+        sky=[(0.0, (246, 237, 208)), (0.5, (247, 243, 230)), (1.0, (242, 240, 238))],
+        hills=[(0.60, (229, 227, 239)), (0.70, (217, 215, 232)), (0.82, (206, 203, 222))],
+        fog=(238, 234, 228),
+        text=(62, 58, 70), faint=(176, 170, 178), accent=(118, 108, 146)),
+    "night": dict(
+        sky=[(0.0, (22, 24, 38)), (0.55, (42, 41, 61)), (1.0, (56, 50, 68))],
+        hills=[(0.60, (49, 47, 70)), (0.70, (39, 38, 58)), (0.82, (30, 30, 46))],
+        fog=(50, 46, 62),
+        text=(222, 216, 228), faint=(100, 98, 122), accent=(180, 170, 212)),
+}
+
+KEYS = {
+    "\x1b[A": "up", "\x1bOA": "up", "\x1b[B": "down", "\x1bOB": "down",
+    "\x1b[C": "right", "\x1bOC": "right", "\x1b[D": "left", "\x1bOD": "left",
+    "\x1b[H": "home", "\x1bOH": "home", "\x1b[1~": "home", "\x1b[7~": "home", "\x01": "home",
+    "\x1b[F": "end", "\x1bOF": "end", "\x1b[4~": "end", "\x1b[8~": "end", "\x05": "end",
+    "\x1b[3~": "delete", "\x1b[5~": "pgup", "\x1b[6~": "pgdn",
+    "\x1b[1;3C": "wright", "\x1b[1;5C": "wright", "\x1b[1;9C": "wright", "\x1bf": "wright",
+    "\x1b[1;3D": "wleft", "\x1b[1;5D": "wleft", "\x1b[1;9D": "wleft", "\x1bb": "wleft",
+    "\x1b\x7f": "wback", "\x17": "wback", "\x7f": "back", "\x08": "back", "\x0b": "kill", "\x15": "killbol",
+    "\r": "enter", "\n": "enter", "\t": "tab",
+    "\x0f": "switch", "\x10": "switch", "\x14": "theme", "\x1a": "undo", "\x13": "save",
+    "\x1b": "esc", "\x11": "quit", "\x03": "copy",
+}
+OSC = re.compile(r"\x1b\][^\x07\x1b]*(\x07|\x1b\\)")
+CSI = re.compile(r"\x1b(\[[0-9;?<]*[A-Za-z~]|O[A-Za-z])")
+
+
+# ---------- small helpers ----------
+
+def write(s):
+    data = s.encode("utf-8")
+    while data:
+        n = os.write(sys.stdout.fileno(), data)
+        data = data[n:]
+
+
+def clamp(v, lo, hi):
+    return lo if v < lo else hi if v > hi else v
+
+
+def mix(a, b, t):
+    return tuple(a[i] + (b[i] - a[i]) * t for i in range(3))
+
+
+def gradient(stops, v):
+    for (p0, c0), (p1, c1) in zip(stops, stops[1:]):
+        if v <= p1:
+            return mix(c0, c1, clamp((v - p0) / (p1 - p0), 0, 1))
+    return stops[-1][1]
+
+
+def idx256(c):
+    r, g, b = c
+    lv = [0, 95, 135, 175, 215, 255]
+    q = lambda v: min(range(6), key=lambda i: abs(lv[i] - v))
+    cr, cg, cb = q(r), q(g), q(b)
+    gi = clamp(round(((r + g + b) / 3 - 8) / 10), 0, 23)
+    gv = 8 + gi * 10
+    dc = (lv[cr] - r) ** 2 + (lv[cg] - g) ** 2 + (lv[cb] - b) ** 2
+    dg = (gv - r) ** 2 + (gv - g) ** 2 + (gv - b) ** 2
+    return 16 + 36 * cr + 6 * cg + cb if dc <= dg else 232 + gi
+
+
+def sgr(fg, bg):
+    if TRUECOLOR:
+        return "\x1b[38;2;%d;%d;%d;48;2;%d;%d;%dm" % (fg + bg)
+    return "\x1b[38;5;%d;48;5;%dm" % (idx256(fg), idx256(bg))
+
+
+def ago(t):
+    d = time.time() - t
+    for n, u in ((31536000, "y"), (604800, "w"), (86400, "d"), (3600, "h"), (60, "m")):
+        if d >= n:
+            return "%d%s" % (d // n, u)
+    return "now"
+
+
+def clean_name(name):
+    name = re.sub(r"[/:\\]", "-", name.strip()).lstrip(".")
+    return name[:-3] if name.lower().endswith(".md") else name
+
+
+def note_path(name):
+    return NOTES_DIR / (name + ".md")
+
+
+def list_notes():
+    if not NOTES_DIR.exists():
+        return []
+    items = [(p.stem, p.stat().st_mtime) for p in NOTES_DIR.glob("*.md")]
+    return sorted(items, key=lambda x: -x[1])
+
+
+def load_state():
+    try:
+        return json.loads(STATE_FILE.read_text())
+    except Exception:
+        return {}
+
+
+def save_state(**kw):
+    st = load_state()
+    st.update(kw)
+    try:
+        NOTES_DIR.mkdir(parents=True, exist_ok=True)
+        STATE_FILE.write_text(json.dumps(st))
+    except OSError:
+        pass
+
+
+def wrap(s, w):
+    """Word-wrap offsets: start index of each visual segment of s."""
+    starts, i = [0], 0
+    while len(s) - i > w:
+        cut = s.rfind(" ", i, i + w + 1)
+        cut = i + w if cut <= i else cut + 1
+        starts.append(cut)
+        i = cut
+    return starts
+
+
+# ---------- the landscape ----------
+
+def ridge_fn(layer):
+    rnd = random.Random(11 + layer * 7)
+    amp = (1.6, 1.15, 1.0)[layer]
+    waves = [(f, a * amp, rnd.random()) for f, a in
+             ((0.55, 0.050), (1.3, 0.030), (2.7, 0.016), (5.9, 0.008), (12.5, 0.004), (27.0, 0.002))]
+    slope = (0.16, 0.05, 0.06)[layer]
+
+    def h(u):
+        v = slope * (0.5 - u) * (1 if layer != 1 else -0.6)
+        for f, a, p in waves:
+            v += a * math.sin(2 * math.pi * (f * u + p))
+        return v
+    return h
+
+
+def build_background(W, H, theme):
+    T = THEMES[theme]
+    edges = []
+    for li, (base, _) in enumerate(T["hills"]):
+        h = ridge_fn(li)
+        edges.append([H * (base - h(x / max(W - 1, 1))) for x in range(W)])
+    grid = []
+    for y in range(H):
+        sky = gradient(T["sky"], (y + 0.5) / H)
+        row = []
+        for x in range(W):
+            c = sky
+            for li, (_, col) in enumerate(T["hills"]):
+                cov = clamp(y + 1 - edges[li][x], 0.0, 1.0)
+                if cov > 0:
+                    depth = max(0.0, (y + 0.5 - edges[li][x]) / H)
+                    t = clamp(depth / 0.4, 0, 1)
+                    c = mix(c, mix(col, T["fog"], t * t * (3 - 2 * t) * 0.6), cov)
+            row.append(tuple(int(round(v)) for v in c))
+        grid.append(row)
+    return grid
+
+
+# ---------- the editor ----------
+
+class Editor:
+    def __init__(self, name):
+        self.fd = sys.stdin.fileno()
+        self.theme = load_state().get("theme", "day")
+        if self.theme not in THEMES:
+            self.theme = "day"
+        self.dec = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        self.mode = "edit"
+        self.bg_key = None
+        self.msg, self.msg_t = "", 0.0
+        self.running = True
+        self.resized = False
+        self.pending = ""
+        self.orig_bg = None
+        self.open(name)
+
+    # --- files ---
+
+    def open(self, name):
+        self.name = name
+        self.path = note_path(name)
+        try:
+            text = self.path.read_text(encoding="utf-8")
+            self.mtime = self.path.stat().st_mtime_ns
+        except FileNotFoundError:
+            text, self.mtime = "", None
+        self.lines = text.split("\n")
+        self.cy = len(self.lines) - 1
+        self.cx = len(self.lines[-1])
+        self.scroll = 0
+        self.goal = None
+        self.anchor = None
+        self.undo = []
+        self.last_kind, self.last_edit = None, 0.0
+        self.dirty = False
+        save_state(last=name)
+
+    def save(self):
+        if not self.dirty:
+            return
+        text = "\n".join(self.lines)
+        self.dirty = False
+        if self.mtime is None and not text.strip():
+            return  # don't litter empty notes
+        NOTES_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_name("." + self.path.name + ".tmp")
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, self.path)
+        self.mtime = self.path.stat().st_mtime_ns
+
+    def check_external(self):
+        """Pick up edits made to the file by something else (e.g. Claude)."""
+        try:
+            m = self.path.stat().st_mtime_ns
+        except FileNotFoundError:
+            return False
+        if m == self.mtime or self.dirty:
+            return False
+        self.lines = self.path.read_text(encoding="utf-8").split("\n")
+        self.mtime = m
+        self.cy = min(self.cy, len(self.lines) - 1)
+        self.cx = min(self.cx, len(self.lines[self.cy]))
+        self.anchor = None
+        self.flash("updated")
+        return True
+
+    def flash(self, msg):
+        self.msg, self.msg_t = msg, time.monotonic()
+
+    # --- editing ---
+
+    def snap(self, kind, force=False):
+        now = time.monotonic()
+        if force or kind != self.last_kind or now - self.last_edit > 1.0:
+            self.undo.append((list(self.lines), self.cy, self.cx))
+            del self.undo[:-300]
+        self.last_kind, self.last_edit = kind, now
+        self.dirty = True
+
+    def insert(self, text):
+        line = self.lines[self.cy]
+        before, after = line[: self.cx], line[self.cx:]
+        parts = text.split("\n")
+        if len(parts) == 1:
+            self.lines[self.cy] = before + text + after
+            self.cx += len(text)
+        else:
+            self.lines[self.cy: self.cy + 1] = [before + parts[0]] + parts[1:-1] + [parts[-1] + after]
+            self.cy += len(parts) - 1
+            self.cx = len(parts[-1])
+
+    def enter(self):
+        line = self.lines[self.cy]
+        m = re.match(r"(\s*)([-*] \[[ xX]\] |[-*] )", line)
+        self.snap("enter", force=True)
+        if m and self.cx >= m.end():
+            if not line[m.end():].strip() and self.cx == len(line):
+                self.lines[self.cy] = ""  # empty bullet: end the list
+                self.cx = 0
+                return
+            self.insert("\n" + m.group(1) + re.sub(r"\[[xX]\]", "[ ]", m.group(2)))
+        else:
+            self.insert("\n")
+
+    def back(self):
+        if self.cx > 0:
+            line = self.lines[self.cy]
+            self.lines[self.cy] = line[: self.cx - 1] + line[self.cx:]
+            self.cx -= 1
+        elif self.cy > 0:
+            self.cx = len(self.lines[self.cy - 1])
+            self.lines[self.cy - 1] += self.lines.pop(self.cy)
+            self.cy -= 1
+
+    def delete(self):
+        line = self.lines[self.cy]
+        if self.cx < len(line):
+            self.lines[self.cy] = line[: self.cx] + line[self.cx + 1:]
+        elif self.cy < len(self.lines) - 1:
+            self.lines[self.cy] += self.lines.pop(self.cy + 1)
+
+    def word_left(self):
+        line, i = self.lines[self.cy], self.cx
+        if i == 0:
+            return self.move(-1)
+        while i > 0 and not line[i - 1].isalnum():
+            i -= 1
+        while i > 0 and line[i - 1].isalnum():
+            i -= 1
+        self.cx = i
+
+    def word_right(self):
+        line, i = self.lines[self.cy], self.cx
+        if i == len(line):
+            return self.move(1)
+        while i < len(line) and not line[i].isalnum():
+            i += 1
+        while i < len(line) and line[i].isalnum():
+            i += 1
+        self.cx = i
+
+    def move(self, d):
+        if d < 0:
+            if self.cx > 0:
+                self.cx -= 1
+            elif self.cy > 0:
+                self.cy -= 1
+                self.cx = len(self.lines[self.cy])
+        else:
+            if self.cx < len(self.lines[self.cy]):
+                self.cx += 1
+            elif self.cy < len(self.lines) - 1:
+                self.cy += 1
+                self.cx = 0
+
+    def layout(self, w):
+        vis, crow = [], 0
+        for i, line in enumerate(self.lines):
+            st = wrap(line, w)
+            for k, s in enumerate(st):
+                last = k == len(st) - 1
+                e = len(line) if last else st[k + 1]
+                if i == self.cy and s <= self.cx and (self.cx < e or last):
+                    crow = len(vis)
+                vis.append((i, s, e, last))
+        return vis, crow
+
+    def vmove(self, d):
+        vis, crow = self.layout(self.w)
+        i, s, e, last = vis[crow]
+        if self.goal is None:
+            self.goal = self.cx - s
+        nr = crow + d
+        if nr < 0:
+            self.cy, self.cx = 0, 0
+            return
+        if nr >= len(vis):
+            self.cy = len(self.lines) - 1
+            self.cx = len(self.lines[-1])
+            return
+        i, s, e, last = vis[nr]
+        self.cy = i
+        self.cx = s + min(self.goal, e - s if last else e - s - 1)
+
+    # --- selection & clipboard ---
+
+    def selection(self):
+        if self.anchor is None or self.anchor == (self.cy, self.cx):
+            return None
+        return tuple(sorted([self.anchor, (self.cy, self.cx)]))
+
+    def sel_text(self, a, b):
+        (y0, x0), (y1, x1) = a, b
+        if y0 == y1:
+            return self.lines[y0][x0:x1]
+        return "\n".join([self.lines[y0][x0:]] + self.lines[y0 + 1: y1] + [self.lines[y1][:x1]])
+
+    def delete_sel(self, a, b):
+        (y0, x0), (y1, x1) = a, b
+        self.snap("delete", force=True)
+        self.lines[y0: y1 + 1] = [self.lines[y0][:x0] + self.lines[y1][x1:]]
+        self.cy, self.cx, self.anchor = y0, x0, None
+
+    def copy(self, text):
+        try:
+            subprocess.run(["pbcopy"], input=text.encode("utf-8"), check=True)
+        except (OSError, subprocess.CalledProcessError):
+            write("\x1b]52;c;%s\x07" % base64.b64encode(text.encode("utf-8")).decode())
+        self.flash("copied")
+
+    def pos_at(self, x, y):
+        top, x0, vis = self.view
+        idx = y - top + self.scroll
+        i, s, e, last = vis[clamp(idx, 0, len(vis) - 1)]
+        if idx < 0:
+            return (i, s)
+        if idx >= len(vis):
+            return (i, e)
+        return (i, s + clamp(x - x0, 0, e - s if last else e - s - 1))
+
+    def mouse(self, k):
+        m = re.match(r"\x1b\[<(\d+);(\d+);(\d+)([Mm])", k)
+        if not m or self.mode != "edit" or not hasattr(self, "view"):
+            return
+        b, x, y, release = int(m[1]), int(m[2]) - 1, int(m[3]) - 1, m[4] == "m"
+        if b & 64:  # wheel
+            self.anchor = None
+            self.vmove(3 if b & 1 else -3)
+            return
+        if b & 3:  # only the left button
+            return
+        self.goal = None
+        self.cy, self.cx = self.pos_at(x, y)
+        if release:
+            sel = self.selection()
+            if sel:
+                self.copy(self.sel_text(*sel))
+            else:
+                self.anchor = None
+        elif not b & 32:  # press (not drag)
+            self.anchor = (self.cy, self.cx)
+
+    # --- input ---
+
+    def query_bg(self):
+        """Ask the terminal for its background colour, so we can borrow and restore it."""
+        write("\x1b]11;?\x07")
+        buf, end = "", time.monotonic() + 0.2
+        while time.monotonic() < end:
+            if select.select([self.fd], [], [], 0.05)[0]:
+                buf += self.dec.decode(os.read(self.fd, 1024))
+                m = OSC.search(buf)
+                if m:
+                    self.pending = buf[: m.start()] + buf[m.end():]
+                    found = re.match(r"\x1b\]11;(rgb:[0-9a-fA-F/]+)", m.group(0))
+                    self.orig_bg = found.group(1) if found else None
+                    return
+        self.pending = buf
+
+    def read_keys(self):
+        buf = self.pending + self.dec.decode(os.read(self.fd, 65536))
+        self.pending = ""
+        while True:
+            in_paste = "\x1b[200~" in buf and "\x1b[201~" not in buf.rsplit("\x1b[200~", 1)[1]
+            partial = buf.endswith("\x1b") or re.search(r"\x1b(\[[0-9;?<]*|O)$", buf)
+            if not (in_paste or partial):
+                break
+            if not select.select([self.fd], [], [], 2.0 if in_paste else 0.03)[0]:
+                break
+            buf += self.dec.decode(os.read(self.fd, 65536))
+        buf = OSC.sub("", buf)  # late terminal replies are not keystrokes
+        keys, i = [], 0
+        while i < len(buf):
+            if buf.startswith("\x1b[200~", i):
+                end = buf.find("\x1b[201~", i)
+                end = len(buf) if end < 0 else end
+                keys.append(("paste", buf[i + 6: end]))
+                i = end + 6
+                continue
+            if buf[i] == "\x1b":
+                m = CSI.match(buf, i)
+                if m:
+                    keys.append(m.group(0))
+                    i = m.end()
+                elif i + 1 < len(buf):
+                    keys.append(buf[i: i + 2])
+                    i += 2
+                else:
+                    keys.append("\x1b")
+                    i += 1
+                continue
+            keys.append(buf[i])
+            i += 1
+        return keys
+
+    def handle(self, k):
+        if isinstance(k, tuple):
+            text = k[1].replace("\r\n", "\n").replace("\r", "\n").replace("\t", "    ")
+            text = "".join(c for c in text if c == "\n" or c >= " ")
+            if self.mode == "switch":
+                self.query += text.split("\n")[0]
+                self.sel = 0
+            else:
+                self.goal = None
+                if self.selection():
+                    self.delete_sel(*self.selection())
+                self.anchor = None
+                self.snap("paste", force=True)
+                self.insert(text)
+            return
+        if k.startswith("\x1b[<"):
+            return self.mouse(k)
+        name = KEYS.get(k)
+        if self.mode == "switch":
+            return self.handle_switch(k, name)
+        if name not in ("up", "down", "pgup", "pgdn"):
+            self.goal = None
+        sel = self.selection()
+        if name == "copy":
+            return self.copy(self.sel_text(*sel) if sel else "\n".join(self.lines))
+        if sel and name in ("back", "delete", "wback", "kill", "killbol"):
+            return self.delete_sel(*sel)
+        if sel and name == "esc":
+            self.anchor = None
+            return
+        if sel and (name in ("enter", "tab") or (name is None and len(k) == 1 and k >= " ")):
+            self.delete_sel(*sel)
+        self.anchor = None
+        if name is None:
+            if len(k) == 1 and k >= " ":
+                self.snap("type", force=(k == " " and self.cx > 0 and self.lines[self.cy][self.cx - 1] != " "))
+                self.insert(k)
+        elif name in ("quit", "esc"):
+            self.running = False
+        elif name == "switch":
+            self.save()
+            self.mode, self.query, self.sel = "switch", "", 0
+        elif name == "theme":
+            self.theme = "night" if self.theme == "day" else "day"
+            save_state(theme=self.theme)
+        elif name == "save":
+            self.dirty = True
+            self.save()
+            self.flash("saved")
+        elif name == "undo":
+            if self.undo:
+                self.lines, self.cy, self.cx = self.undo.pop()
+                self.last_kind = None
+                self.dirty = True
+            else:
+                self.flash("nothing to undo")
+        elif name == "enter":
+            self.enter()
+        elif name == "tab":
+            self.snap("type")
+            self.insert("    ")
+        elif name == "back":
+            self.snap("delete")
+            self.back()
+        elif name == "delete":
+            self.snap("delete")
+            self.delete()
+        elif name == "wback":
+            self.snap("delete", force=True)
+            end = (self.cy, self.cx)
+            self.word_left()
+            if (self.cy, self.cx) != end:
+                if self.cy == end[0]:
+                    line = self.lines[self.cy]
+                    self.lines[self.cy] = line[: self.cx] + line[end[1]:]
+                else:
+                    self.delete()
+        elif name == "kill":
+            self.snap("delete", force=True)
+            line = self.lines[self.cy]
+            if self.cx < len(line):
+                self.lines[self.cy] = line[: self.cx]
+            else:
+                self.delete()
+        elif name == "killbol":
+            self.snap("delete", force=True)
+            self.lines[self.cy] = self.lines[self.cy][self.cx:]
+            self.cx = 0
+        elif name == "left":
+            self.move(-1)
+        elif name == "right":
+            self.move(1)
+        elif name == "wleft":
+            self.word_left()
+        elif name == "wright":
+            self.word_right()
+        elif name == "up":
+            self.vmove(-1)
+        elif name == "down":
+            self.vmove(1)
+        elif name == "pgup":
+            self.vmove(-max(1, self.rows - 2))
+        elif name == "pgdn":
+            self.vmove(max(1, self.rows - 2))
+        elif name == "home":
+            vis, crow = self.layout(self.w)
+            self.cx = vis[crow][1]
+        elif name == "end":
+            vis, crow = self.layout(self.w)
+            _, s, e, last = vis[crow]
+            self.cx = e if last else e - 1
+
+    def switch_items(self):
+        notes = list_notes()
+        q = self.query.strip()
+        items = [(n, m) for n, m in notes if q.lower() in n.lower()]
+        items.sort(key=lambda x: not x[0].lower().startswith(q.lower()))
+        if q and not any(n.lower() == clean_name(q).lower() for n, _ in notes):
+            items.insert(0, (clean_name(q), None))
+        return items
+
+    def handle_switch(self, k, name):
+        items = self.switch_items()
+        if name in ("esc", "switch"):
+            self.mode = "edit"
+        elif name == "quit":
+            self.running = False
+        elif name == "up":
+            self.sel = max(0, self.sel - 1)
+        elif name == "down":
+            self.sel = min(len(items) - 1, self.sel + 1)
+        elif name in ("back", "wback"):
+            self.query = "" if name == "wback" else self.query[:-1]
+            self.sel = 0
+        elif name == "enter":
+            if items and items[self.sel][0]:
+                self.open(items[self.sel][0])
+                self.mode = "edit"
+        elif name is None and len(k) == 1 and k >= " ":
+            self.query += k
+            self.sel = 0
+
+    # --- drawing ---
+
+    def render(self):
+        W, H = os.get_terminal_size(sys.stdout.fileno())
+        T = THEMES[self.theme]
+        out = ["\x1b[?2026h\x1b[?25l"]
+        if self.bg_key != (W, H, self.theme):
+            self.bg_key = (W, H, self.theme)
+            self.bg = build_background(W, H, self.theme)
+            if self.orig_bg:
+                # the pixels past the last full cell use the terminal's own background
+                edge = [row[-1] for row in self.bg] + self.bg[-1]
+                avg = tuple(sum(c[k] for c in edge) // len(edge) for k in range(3))
+                out.append("\x1b]11;rgb:%02x/%02x/%02x\x07" % avg)
+            for y, row in enumerate(self.bg):
+                out.append("\x1b[%d;1H" % (y + 1))
+                last = None
+                for c in row:
+                    if c != last:
+                        out.append(sgr(c, c))
+                        last = c
+                    out.append(" ")
+
+        self.w = w = max(10, min(WIDTH, W - 6))
+        x0 = (W - w) // 2
+        top, bottom = max(1, int(H * 0.26)), H - 4
+        if bottom - top < 3:
+            top, bottom = 0, H - 2
+        self.rows = rows = bottom - top + 1
+        rx0, rx1 = max(0, x0 - 2), min(W, x0 + w + 3)
+        chars = [[" "] * (rx1 - rx0) for _ in range(H)]
+        fgs = [[None] * (rx1 - rx0) for _ in range(H)]
+        hls = [[False] * (rx1 - rx0) for _ in range(H)]
+
+        def put(y, x, s, fg):
+            if 0 <= y < H:
+                for j, ch in enumerate(s):
+                    if rx0 <= x + j < rx1:
+                        chars[y][x + j - rx0] = ch
+                        fgs[y][x + j - rx0] = fg
+
+        status_y = H - 2
+        if self.mode == "edit":
+            vis, crow = self.layout(w)
+            sel = self.selection()
+            self.view = (top, x0, vis)
+            self.scroll = clamp(self.scroll, crow - rows + 1, crow)
+            self.scroll = clamp(self.scroll, 0, max(0, len(vis) - 1))
+            for r in range(rows):
+                idx = self.scroll + r
+                if idx >= len(vis):
+                    break
+                i, s, e, _ = vis[idx]
+                put(top + r, x0, self.lines[i][s:e], T["accent"] if self.lines[i].startswith("#") else T["text"])
+                if sel:
+                    for j in range(e - s):
+                        if sel[0] <= (i, s + j) < sel[1] and rx0 <= x0 + j < rx1:
+                            hls[top + r][x0 + j - rx0] = True
+            if len(self.lines) == 1 and not self.lines[0]:
+                put(top, x0, "start writing.", T["faint"])
+                put(top + 2, x0, "ctrl-o notes   ctrl-c copy   ctrl-t day/night   esc close", T["faint"])
+            cur = (top + crow - self.scroll, x0 + min(self.cx - vis[crow][1], w))
+            words = len(re.findall(r"\S+", "\n".join(self.lines)))
+            right = self.msg or ("%d word%s" % (words, "" if words == 1 else "s"))
+            put(status_y, x0, self.name[: w - len(right) - 2], T["faint"])
+            put(status_y, x0 + w - len(right), right, T["faint"])
+        else:
+            items = self.switch_items()
+            self.sel = clamp(self.sel, 0, max(0, len(items) - 1))
+            put(top, x0, self.query or "find or name a note", T["text"] if self.query else T["faint"])
+            cur = (top, x0 + min(len(self.query), w))
+            avail = max(1, rows - 2)
+            first = clamp(self.sel - avail + 1, 0, max(0, len(items) - avail))
+            for r, (n, m) in enumerate(items[first: first + avail]):
+                y, selected = top + 2 + r, first + r == self.sel
+                col = T["text"] if selected else T["faint"]
+                put(y, x0 - 2, "›" if selected else " ", T["accent"])
+                if m is None:
+                    put(y, x0, ("new  " + n)[:w], col)
+                    put(y, x0, "new", T["accent"])
+                else:
+                    t = ago(m)
+                    put(y, x0, n[: w - len(t) - 2], col)
+                    put(y, x0 + w - len(t), t, T["faint"])
+            if not items:
+                put(top + 2, x0, "no notes yet. type a name.", T["faint"])
+            hint = "enter open   esc back"
+            put(status_y, x0 + w - len(hint), hint, T["faint"])
+
+        for y in range(H):
+            out.append("\x1b[%d;%dH" % (y + 1, rx0 + 1))
+            last, bgrow = None, self.bg[y]
+            for j in range(rx1 - rx0):
+                bgc = bgrow[rx0 + j]
+                if hls[y][j]:
+                    bgc = tuple(int(v) for v in mix(bgc, T["accent"], 0.28))
+                key = (fgs[y][j] or T["text"], bgc)
+                if key != last:
+                    out.append(sgr(*key))
+                    last = key
+                out.append(chars[y][j])
+        out.append("\x1b[%d;%dH\x1b[?25h\x1b[?2026l" % (cur[0] + 1, cur[1] + 1))
+        write("".join(out))
+
+    # --- main loop ---
+
+    def run(self):
+        old = termios.tcgetattr(self.fd)
+
+        def on_hup(*_):
+            raise SystemExit(0)
+        signal.signal(signal.SIGWINCH, lambda *_: setattr(self, "resized", True))
+        signal.signal(signal.SIGHUP, on_hup)
+        signal.signal(signal.SIGTERM, on_hup)
+        tty.setraw(self.fd, termios.TCSANOW)
+        if os.environ.get("TERM_PROGRAM") not in ("WarpTerminal", "Apple_Terminal"):  # they ignore it
+            self.query_bg()
+        write("\x1b[?1049h\x1b[?2004h\x1b[?7l\x1b[5 q\x1b[?1000h\x1b[?1002h\x1b[?1006h")
+        last_check = time.monotonic()
+        try:
+            self.render()
+            while self.running:
+                need = False
+                if select.select([self.fd], [], [], 0.25)[0]:
+                    for k in self.read_keys():
+                        self.handle(k)
+                        if not self.running:
+                            break
+                    need = True
+                now = time.monotonic()
+                if self.dirty and now - self.last_edit > 0.8:
+                    self.save()
+                if now - last_check > 1.0:
+                    last_check = now
+                    need |= self.check_external()
+                if self.msg and now - self.msg_t > 1.5:
+                    self.msg = ""
+                    need = True
+                if self.resized:
+                    self.resized, need = False, True
+                if need and self.running:
+                    self.render()
+        finally:
+            try:
+                self.save()
+            finally:
+                try:
+                    if self.orig_bg:
+                        write("\x1b]11;%s\x07" % self.orig_bg)
+                    write("\x1b[0m\x1b[0 q\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?7h\x1b[?2004l\x1b[?1049l")
+                    termios.tcsetattr(self.fd, termios.TCSADRAIN, old)
+                except OSError:
+                    pass
+
+
+def main():
+    args = sys.argv[1:]
+    if args and args[0] in ("-h", "--help"):
+        print(__doc__.strip())
+        return
+    if args and args[0] in ("-l", "--list"):
+        for n, m in list_notes():
+            print("%5s  %s" % (ago(m), n))
+        return
+    if args and args[0] == "--dir":
+        print(NOTES_DIR)
+        return
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        sys.exit("notes: needs a terminal")
+    NOTES_DIR.mkdir(parents=True, exist_ok=True)
+    name = clean_name(" ".join(args)) if args else load_state().get("last") or "notes"
+    Editor(name or "notes").run()
+
+
+if __name__ == "__main__":
+    main()

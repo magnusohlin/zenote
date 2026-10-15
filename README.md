@@ -4,7 +4,7 @@ A quiet place to write, in the terminal.
 
 Type `notes` and your terminal turns into a still lake in morning fog, with a single narrow column of text in the middle. There are two scenes, both drawn from photos: **lake** (a wooded island and its reflection, the water darkening toward you) and **fog** (nothing but a soft gradient from bright mist to dark water). Each has a day and a night version. No menus, no chrome. Inspired by [OmmWriter](https://ommwriter.com).
 
-![zenote in night mode](docs/screenshot.png)
+![zenote, lake scene by day](docs/screenshot.png)
 
 Notes are plain markdown files in `~/notes`, so anything else can read them: grep, your editor, or an AI assistant like Claude Code.
 

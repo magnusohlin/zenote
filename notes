@@ -41,15 +41,17 @@ TRUECOLOR = os.environ.get("NOTES_COLOR") != "256" and (
 
 THEMES = {
     "day": dict(
-        sky=[(0.0, (246, 237, 208)), (0.5, (247, 243, 230)), (1.0, (242, 240, 238))],
-        hills=[(0.60, (229, 227, 239)), (0.70, (217, 215, 232)), (0.82, (206, 203, 222))],
-        fog=(238, 234, 228),
-        text=(62, 58, 70), faint=(176, 170, 178), accent=(118, 108, 146)),
+        sky_top=(234, 238, 245), sky_horizon=(203, 207, 213),
+        trees=(86, 96, 94), reflection=(70, 78, 80),
+        water=[(0.0, (196, 200, 206)), (0.25, (150, 156, 164)), (0.6, (96, 103, 113)), (1.0, (56, 62, 72))],
+        text=(50, 54, 62), faint=(150, 156, 164), accent=(84, 98, 120),
+        on_dark=dict(text=(228, 232, 238), faint=(140, 148, 160), accent=(176, 190, 210))),
     "night": dict(
-        sky=[(0.0, (22, 24, 38)), (0.55, (42, 41, 61)), (1.0, (56, 50, 68))],
-        hills=[(0.60, (49, 47, 70)), (0.70, (39, 38, 58)), (0.82, (30, 30, 46))],
-        fog=(50, 46, 62),
-        text=(222, 216, 228), faint=(100, 98, 122), accent=(180, 170, 212)),
+        sky_top=(24, 28, 36), sky_horizon=(54, 58, 66),
+        trees=(16, 20, 22), reflection=(14, 17, 20),
+        water=[(0.0, (48, 52, 60)), (0.25, (35, 39, 47)), (0.6, (22, 25, 32)), (1.0, (11, 13, 18))],
+        text=(214, 220, 228), faint=(104, 110, 122), accent=(168, 182, 204),
+        on_dark=dict(text=(214, 220, 228), faint=(104, 110, 122), accent=(168, 182, 204))),
 }
 
 KEYS = {
@@ -111,6 +113,12 @@ def sgr(fg, bg):
     return "\x1b[38;5;%d;48;5;%dm" % (idx256(fg), idx256(bg))
 
 
+def ink(T, role, bg):
+    """Text colour for a role, flipping to light ink where the background is dark."""
+    lum = (0.299 * bg[0] + 0.587 * bg[1] + 0.114 * bg[2]) / 255
+    return T["on_dark"][role] if lum < 0.45 else T[role]
+
+
 def ago(t):
     d = time.time() - t
     for n, u in ((31536000, "y"), (604800, "w"), (86400, "d"), (3600, "h"), (60, "m")):
@@ -163,42 +171,87 @@ def wrap(s, w):
     return starts
 
 
-# ---------- the landscape ----------
+# ---------- the landscape: a still lake in fog ----------
 
-def ridge_fn(layer):
-    rnd = random.Random(11 + layer * 7)
-    amp = (1.6, 1.15, 1.0)[layer]
-    waves = [(f, a * amp, rnd.random()) for f, a in
-             ((0.55, 0.050), (1.3, 0.030), (2.7, 0.016), (5.9, 0.008), (12.5, 0.004), (27.0, 0.002))]
-    slope = (0.16, 0.05, 0.06)[layer]
+HORIZON = 0.565
 
-    def h(u):
-        v = slope * (0.5 - u) * (1 if layer != 1 else -0.6)
-        for f, a, p in waves:
-            v += a * math.sin(2 * math.pi * (f * u + p))
-        return v
-    return h
+
+def make_crowns():
+    rnd = random.Random(5)
+    crowns, u = [], -0.03
+    while u < 0.27:
+        r = rnd.uniform(0.016, 0.034)
+        crowns.append((u, r, rnd.uniform(0.6, 1.0)))
+        u += r * rnd.uniform(0.9, 1.4)
+    return crowns
+
+
+CROWNS = make_crowns()
+
+
+def island_height(u):
+    """Height of the wooded island above the waterline, as a fraction of screen height."""
+    if u < 0.285:
+        body = 0.095 - 0.16 * u
+        crown = max(math.sqrt(max(0.0, 1 - ((u - c) / r) ** 2)) * r * 2.2 * k for c, r, k in CROWNS)
+        shoulder = math.sqrt(clamp((0.285 - u) / 0.06, 0, 1))  # the island rounds off into the water
+        return max((body + crown) * shoulder, 0.004)
+    if u < 0.345:  # a low spit of land reaching into the fog
+        return 0.004 * (0.345 - u) / 0.075 + 0.0015
+    return 0.0
+
+
+def sky_at(T, v):
+    t = clamp(v / HORIZON, 0, 1) ** 1.4
+    return mix(T["sky_top"], T["sky_horizon"], t)
+
+
+def water_at(T, v):
+    d = (v - HORIZON) / (1 - HORIZON)
+    c = gradient(T["water"], d)
+    ripple = math.sin(5.0 / (d + 0.05)) * (0.3 + 2.5 * d)  # bands that widen toward the viewer
+    return tuple(x + ripple for x in c)
+
+
+def sample(T, u, v, h):
+    if v < HORIZON:
+        c = sky_at(T, v)
+        if HORIZON - v < h:  # trees, fading into the fog toward their tops
+            t = (HORIZON - v) / h
+            c = mix(T["trees"], c, 0.08 + 0.55 * t ** 1.4 + 0.3 * u)
+        elif u > 0.5 and HORIZON - v < 0.012 + 0.006 * math.sin(u * 37):  # the far shore, barely there
+            c = mix(c, T["trees"], 0.06)
+        return c
+    c = water_at(T, v)
+    depth = v - HORIZON
+    if depth < h * 0.95:  # the island's reflection, broken up by ripples
+        fade = 1 - (depth / (h * 0.95)) ** 1.5 * 0.7
+        c = mix(c, T["reflection"], 0.6 * fade)
+    return c
 
 
 def build_background(W, H, theme):
     T = THEMES[theme]
-    edges = []
-    for li, (base, _) in enumerate(T["hills"]):
-        h = ridge_fn(li)
-        edges.append([H * (base - h(x / max(W - 1, 1))) for x in range(W)])
+    sub = 4
+    vs = [[(y + (k + 0.5) / sub) / H for k in range(sub)] for y in range(H)]
+    island_cols = [x for x in range(W) if (x + 1) / W <= 0.36]
     grid = []
     for y in range(H):
-        sky = gradient(T["sky"], (y + 0.5) / H)
-        row = []
-        for x in range(W):
-            c = sky
-            for li, (_, col) in enumerate(T["hills"]):
-                cov = clamp(y + 1 - edges[li][x], 0.0, 1.0)
-                if cov > 0:
-                    depth = max(0.0, (y + 0.5 - edges[li][x]) / H)
-                    t = clamp(depth / 0.4, 0, 1)
-                    c = mix(c, mix(col, T["fog"], t * t * (3 - 2 * t) * 0.6), cov)
-            row.append(tuple(int(round(v)) for v in c))
+        plain = [sample(T, 0.9, v, 0.0) for v in vs[y]]
+        base = tuple(int(round(sum(c[i] for c in plain) / sub)) for i in range(3))
+        row = [base] * W
+        for x in island_cols:  # supersample where the island and its reflection live
+            acc = [0.0, 0.0, 0.0]
+            for du in (0.25, 0.75):
+                u = (x + du) / W
+                ripple = 0.006 * math.sin(vs[y][0] * H * 2.1)
+                h = island_height(u)
+                hr = island_height(u + ripple)
+                for v in vs[y]:
+                    c = sample(T, u, v, h if v < HORIZON else hr)
+                    for i in range(3):
+                        acc[i] += c[i]
+            row[x] = tuple(int(round(a / (2 * sub))) for a in acc)
         grid.append(row)
     return grid
 
@@ -695,41 +748,41 @@ class Editor:
                 if idx >= len(vis):
                     break
                 i, s, e, _ = vis[idx]
-                put(top + r, x0, self.lines[i][s:e], T["accent"] if self.lines[i].startswith("#") else T["text"])
+                put(top + r, x0, self.lines[i][s:e], "accent" if self.lines[i].startswith("#") else "text")
                 if sel:
                     for j in range(e - s):
                         if sel[0] <= (i, s + j) < sel[1] and rx0 <= x0 + j < rx1:
                             hls[top + r][x0 + j - rx0] = True
             if len(self.lines) == 1 and not self.lines[0]:
-                put(top, x0, "start writing.", T["faint"])
-                put(top + 2, x0, "ctrl-o notes   ctrl-c copy   ctrl-t day/night   esc close", T["faint"])
+                put(top, x0, "start writing.", "faint")
+                put(top + 2, x0, "ctrl-o notes   ctrl-c copy   ctrl-t day/night   esc close", "faint")
             cur = (top + crow - self.scroll, x0 + min(self.cx - vis[crow][1], w))
             words = len(re.findall(r"\S+", "\n".join(self.lines)))
             right = self.msg or ("%d word%s" % (words, "" if words == 1 else "s"))
-            put(status_y, x0, self.name[: w - len(right) - 2], T["faint"])
-            put(status_y, x0 + w - len(right), right, T["faint"])
+            put(status_y, x0, self.name[: w - len(right) - 2], "faint")
+            put(status_y, x0 + w - len(right), right, "faint")
         else:
             items = self.switch_items()
             self.sel = clamp(self.sel, 0, max(0, len(items) - 1))
-            put(top, x0, self.query or "find or name a note", T["text"] if self.query else T["faint"])
+            put(top, x0, self.query or "find or name a note", "text" if self.query else "faint")
             cur = (top, x0 + min(len(self.query), w))
             avail = max(1, rows - 2)
             first = clamp(self.sel - avail + 1, 0, max(0, len(items) - avail))
             for r, (n, m) in enumerate(items[first: first + avail]):
                 y, selected = top + 2 + r, first + r == self.sel
-                col = T["text"] if selected else T["faint"]
-                put(y, x0 - 2, "›" if selected else " ", T["accent"])
+                col = "text" if selected else "faint"
+                put(y, x0 - 2, "›" if selected else " ", "accent")
                 if m is None:
                     put(y, x0, ("new  " + n)[:w], col)
-                    put(y, x0, "new", T["accent"])
+                    put(y, x0, "new", "accent")
                 else:
                     t = ago(m)
                     put(y, x0, n[: w - len(t) - 2], col)
-                    put(y, x0 + w - len(t), t, T["faint"])
+                    put(y, x0 + w - len(t), t, "faint")
             if not items:
-                put(top + 2, x0, "no notes yet. type a name.", T["faint"])
+                put(top + 2, x0, "no notes yet. type a name.", "faint")
             hint = "enter open   esc back"
-            put(status_y, x0 + w - len(hint), hint, T["faint"])
+            put(status_y, x0 + w - len(hint), hint, "faint")
 
         for y in range(H):
             out.append("\x1b[%d;%dH" % (y + 1, rx0 + 1))
@@ -737,8 +790,8 @@ class Editor:
             for j in range(rx1 - rx0):
                 bgc = bgrow[rx0 + j]
                 if hls[y][j]:
-                    bgc = tuple(int(v) for v in mix(bgc, T["accent"], 0.28))
-                key = (fgs[y][j] or T["text"], bgc)
+                    bgc = tuple(int(v) for v in mix(bgc, ink(T, "accent", bgc), 0.28))
+                key = (ink(T, fgs[y][j] or "text", bgc), bgc)
                 if key != last:
                     out.append(sgr(*key))
                     last = key

@@ -2,7 +2,7 @@
 
 A quiet place to write, in the terminal.
 
-Type `notes` and your terminal turns into a calm landscape (a cream sky over soft lavender mountains, or a dusk version at night) with a single narrow column of text in the middle. No menus, no chrome. Inspired by [OmmWriter](https://ommwriter.com).
+Type `notes` and your terminal turns into a still lake in morning fog (a wooded island and its reflection, the water darkening toward you, or a moonlit version at night) with a single narrow column of text in the middle. No menus, no chrome. Inspired by [OmmWriter](https://ommwriter.com).
 
 ![zenote in night mode](docs/screenshot.png)
 

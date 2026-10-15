@@ -9,6 +9,7 @@
 Inside, just type. Everything saves on its own.
   ctrl-o  switch / create note      ctrl-z  undo
   ctrl-c  copy selection or note    ctrl-t  day / night
+  ctrl-b  switch scene (lake / fog)
   esc     close
 Drag with the mouse to select; the selection is copied as clean text.
 
@@ -64,7 +65,7 @@ KEYS = {
     "\x1b[1;3D": "wleft", "\x1b[1;5D": "wleft", "\x1b[1;9D": "wleft", "\x1bb": "wleft",
     "\x1b\x7f": "wback", "\x17": "wback", "\x7f": "back", "\x08": "back", "\x0b": "kill", "\x15": "killbol",
     "\r": "enter", "\n": "enter", "\t": "tab",
-    "\x0f": "switch", "\x10": "switch", "\x14": "theme", "\x1a": "undo", "\x13": "save",
+    "\x0f": "switch", "\x10": "switch", "\x14": "theme", "\x02": "scene", "\x1a": "undo", "\x13": "save",
     "\x1b": "esc", "\x11": "quit", "\x03": "copy",
 }
 OSC = re.compile(r"\x1b\][^\x07\x1b]*(\x07|\x1b\\)")
@@ -230,7 +231,7 @@ def sample(T, u, v, h):
     return c
 
 
-def build_background(W, H, theme):
+def build_lake(W, H, theme):
     T = THEMES[theme]
     sub = 4
     vs = [[(y + (k + 0.5) / sub) / H for k in range(sub)] for y in range(H)]
@@ -256,6 +257,44 @@ def build_background(W, H, theme):
     return grid
 
 
+# ---------- the second scene: nothing but fog ----------
+
+FOG_EDGE = [(0.0, (212, 221, 234)), (0.1, (203, 213, 228)), (0.2, (192, 202, 217)), (0.3, (180, 189, 204)),
+            (0.4, (164, 173, 188)), (0.5, (146, 155, 169)), (0.6, (122, 130, 143)), (0.7, (94, 100, 113)),
+            (0.8, (65, 71, 82)), (0.9, (41, 45, 56)), (1.0, (20, 23, 35))]
+FOG_CENTER = [(0.0, (229, 237, 248)), (0.1, (219, 229, 239)), (0.2, (207, 218, 230)), (0.3, (194, 205, 218)),
+              (0.4, (179, 189, 201)), (0.5, (156, 166, 177)), (0.6, (126, 134, 145)), (0.7, (92, 98, 109)),
+              (0.8, (56, 63, 73)), (0.9, (26, 33, 42)), (1.0, (6, 10, 20))]
+
+
+def build_fog(W, H, theme):
+    glow = [math.exp(-((((x + 0.5) / W) - 0.45) / 0.32) ** 2) for x in range(W)]
+    grid = []
+    for y in range(H):
+        vs = ((y + 0.25) / H, (y + 0.75) / H)
+        edge = mix(gradient(FOG_EDGE, vs[0]), gradient(FOG_EDGE, vs[1]), 0.5)
+        center = mix(gradient(FOG_CENTER, vs[0]), gradient(FOG_CENTER, vs[1]), 0.5)
+        band = math.exp(-(((y + 0.5) / H - 0.555) / 0.012) ** 2)
+        row = []
+        for x in range(W):
+            u = (x + 0.5) / W
+            c = mix(edge, center, glow[x])
+            land = clamp(min(u - 0.31, 0.59 - u) / 0.05, 0, 1) * band  # a smudge of far shore
+            c = mix(c, (104, 110, 118), 0.14 * land)
+            if theme == "night":
+                c = tuple(k * 0.26 + o for k, o in zip(c, (5, 7, 13)))
+            row.append(tuple(int(round(k)) for k in c))
+        grid.append(row)
+    return grid
+
+
+SCENES = {"lake": build_lake, "fog": build_fog}
+
+
+def build_background(W, H, scene, theme):
+    return SCENES[scene](W, H, theme)
+
+
 # ---------- the editor ----------
 
 class Editor:
@@ -264,6 +303,9 @@ class Editor:
         self.theme = load_state().get("theme", "day")
         if self.theme not in THEMES:
             self.theme = "day"
+        self.scene = load_state().get("scene", "lake")
+        if self.scene not in SCENES:
+            self.scene = "lake"
         self.dec = codecs.getincrementaldecoder("utf-8")(errors="replace")
         self.mode = "edit"
         self.bg_key = None
@@ -598,6 +640,11 @@ class Editor:
         elif name == "theme":
             self.theme = "night" if self.theme == "day" else "day"
             save_state(theme=self.theme)
+        elif name == "scene":
+            names = list(SCENES)
+            self.scene = names[(names.index(self.scene) + 1) % len(names)]
+            save_state(scene=self.scene)
+            self.flash(self.scene)
         elif name == "save":
             self.dirty = True
             self.save()
@@ -701,9 +748,9 @@ class Editor:
         W, H = os.get_terminal_size(sys.stdout.fileno())
         T = THEMES[self.theme]
         out = ["\x1b[?2026h\x1b[?25l"]
-        if self.bg_key != (W, H, self.theme):
-            self.bg_key = (W, H, self.theme)
-            self.bg = build_background(W, H, self.theme)
+        if self.bg_key != (W, H, self.scene, self.theme):
+            self.bg_key = (W, H, self.scene, self.theme)
+            self.bg = build_background(W, H, self.scene, self.theme)
             if self.orig_bg:
                 # the pixels past the last full cell use the terminal's own background
                 edge = [row[-1] for row in self.bg] + self.bg[-1]
@@ -755,7 +802,7 @@ class Editor:
                             hls[top + r][x0 + j - rx0] = True
             if len(self.lines) == 1 and not self.lines[0]:
                 put(top, x0, "start writing.", "faint")
-                put(top + 2, x0, "ctrl-o notes   ctrl-c copy   ctrl-t day/night   esc close", "faint")
+                put(top + 2, x0, "ctrl-o notes  ctrl-c copy  ctrl-b scene  ctrl-t night  esc close", "faint")
             cur = (top + crow - self.scroll, x0 + min(self.cx - vis[crow][1], w))
             words = len(re.findall(r"\S+", "\n".join(self.lines)))
             right = self.msg or ("%d word%s" % (words, "" if words == 1 else "s"))

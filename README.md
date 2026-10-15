@@ -2,7 +2,7 @@
 
 A quiet place to write, in the terminal.
 
-Type `notes` and your terminal turns into a still lake in morning fog (a wooded island and its reflection, the water darkening toward you, or a moonlit version at night) with a single narrow column of text in the middle. No menus, no chrome. Inspired by [OmmWriter](https://ommwriter.com).
+Type `notes` and your terminal turns into a still lake in morning fog, with a single narrow column of text in the middle. There are two scenes, both drawn from photos: **lake** (a wooded island and its reflection, the water darkening toward you) and **fog** (nothing but a soft gradient from bright mist to dark water). Each has a day and a night version. No menus, no chrome. Inspired by [OmmWriter](https://ommwriter.com).
 
 ![zenote in night mode](docs/screenshot.png)
 
@@ -37,6 +37,7 @@ Inside, just type. Everything saves on its own, about a second after you stop ty
 | `ctrl-c` | copy the selection, or the whole note if nothing is selected |
 | `ctrl-z` | undo |
 | `ctrl-t` | toggle day / night |
+| `ctrl-b` | switch scene: lake / fog |
 | `esc` / `ctrl-q` | close |
 | mouse | click to place the cursor, drag to select (copied on release), wheel to scroll |
 | `option ←/→` | move by word |
@@ -80,7 +81,7 @@ Environment variables:
 | `NOTES_WIDTH` | `64` | width of the writing column |
 | `NOTES_COLOR` | auto | set to `256` if your terminal lacks truecolor |
 
-The day/night choice and the last opened note are remembered in `~/notes/.state.json`.
+The scene, day/night choice and last opened note are remembered in `~/notes/.state.json`.
 
 ## Notes on terminals
 
